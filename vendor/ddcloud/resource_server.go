@@ -2,34 +2,39 @@ package ddcloud
 
 import (
 	"fmt"
-	"github.com/DimensionDataResearch/go-dd-cloud-compute/compute"
-	"github.com/hashicorp/terraform/helper/schema"
 	"log"
 	"time"
+
+	"github.com/DimensionDataResearch/go-dd-cloud-compute/compute"
+	"github.com/hashicorp/terraform/helper/schema"
 )
 
 const (
-	resourceKeyServerName              = "name"
-	resourceKeyServerDescription       = "description"
-	resourceKeyServerAdminPassword     = "admin_password"
-	resourceKeyServerNetworkDomainID   = "networkdomain"
-	resourceKeyServerMemoryGB          = "memory_gb"
-	resourceKeyServerCPUCount          = "cpu_count"
-	resourceKeyServerOSImageID         = "os_image_id"
-	resourceKeyServerOSImageName       = "os_image_name"
-	resourceKeyServerCustomerImageID   = "customer_image_id"
-	resourceKeyServerCustomerImageName = "customer_image_name"
-	resourceKeyServerPrimaryVLAN       = "primary_adapter_vlan"
-	resourceKeyServerPrimaryIPv4       = "primary_adapter_ipv4"
-	resourceKeyServerPrimaryIPv6       = "primary_adapter_ipv6"
-	resourceKeyServerPublicIPv4        = "public_ipv4"
-	resourceKeyServerPrimaryDNS        = "dns_primary"
-	resourceKeyServerSecondaryDNS      = "dns_secondary"
-	resourceKeyServerAutoStart         = "auto_start"
-	resourceCreateTimeoutServer        = 30 * time.Minute
-	resourceUpdateTimeoutServer        = 10 * time.Minute
-	resourceDeleteTimeoutServer        = 15 * time.Minute
-	serverShutdownTimeout              = 5 * time.Minute
+	resourceKeyServerName               = "name"
+	resourceKeyServerDescription        = "description"
+	resourceKeyServerAdminPassword      = "admin_password"
+	resourceKeyServerNetworkDomainID    = "networkdomain"
+	resourceKeyServerMemoryGB           = "memory_gb"
+	resourceKeyServerCPUCount           = "cpu_count"
+	resourceKeyServerCPUCoreCount       = "cores_per_cpu"
+	resourceKeyServerCPUSpeed           = "cpu_speed"
+	resourceKeyServerOSImageID          = "os_image_id"
+	resourceKeyServerOSImageName        = "os_image_name"
+	resourceKeyServerCustomerImageID    = "customer_image_id"
+	resourceKeyServerCustomerImageName  = "customer_image_name"
+	resourceKeyServerPrimaryAdapterVLAN = "primary_adapter_vlan"
+	resourceKeyServerPrimaryAdapterIPv4 = "primary_adapter_ipv4"
+	resourceKeyServerPrimaryAdapterIPv6 = "primary_adapter_ipv6"
+	resourceKeyServerPrimaryAdapterType = "primary_adapter_type"
+	resourceKeyServerPublicIPv4         = "public_ipv4"
+	resourceKeyServerPrimaryDNS         = "dns_primary"
+	resourceKeyServerSecondaryDNS       = "dns_secondary"
+	resourceKeyServerAutoStart          = "auto_start"
+
+	resourceCreateTimeoutServer = 30 * time.Minute
+	resourceUpdateTimeoutServer = 10 * time.Minute
+	resourceDeleteTimeoutServer = 15 * time.Minute
+	serverShutdownTimeout       = 5 * time.Minute
 )
 
 func resourceServer() *schema.Resource {
@@ -71,6 +76,20 @@ func resourceServer() *schema.Resource {
 				Default:     nil,
 				Description: "The number of CPUs allocated to the server",
 			},
+			resourceKeyServerCPUCoreCount: &schema.Schema{
+				Type:        schema.TypeInt,
+				Optional:    true,
+				Computed:    true,
+				Default:     nil,
+				Description: "The number of cores per CPU allocated to the server",
+			},
+			resourceKeyServerCPUSpeed: &schema.Schema{
+				Type:        schema.TypeString,
+				Optional:    true,
+				Computed:    true,
+				Default:     nil,
+				Description: "The speed (quality-of-service) for CPUs allocated to the server",
+			},
 			resourceKeyServerDisk: schemaServerDisk(),
 			resourceKeyServerNetworkDomainID: &schema.Schema{
 				Type:        schema.TypeString,
@@ -78,7 +97,7 @@ func resourceServer() *schema.Resource {
 				Required:    true,
 				Description: "The Id of the network domain in which the server is deployed",
 			},
-			resourceKeyServerPrimaryVLAN: &schema.Schema{
+			resourceKeyServerPrimaryAdapterVLAN: &schema.Schema{
 				Type:        schema.TypeString,
 				ForceNew:    true,
 				Optional:    true,
@@ -86,13 +105,20 @@ func resourceServer() *schema.Resource {
 				Default:     nil,
 				Description: "The Id of the VLAN to which the server's primary network adapter will be attached (the first available IPv4 address will be allocated)",
 			},
-			resourceKeyServerPrimaryIPv4: &schema.Schema{
+			resourceKeyServerPrimaryAdapterIPv4: &schema.Schema{
 				Type:        schema.TypeString,
-				ForceNew:    true,
 				Optional:    true,
 				Computed:    true,
 				Default:     nil,
 				Description: "The IPv4 address for the server's primary network adapter",
+			},
+			resourceKeyServerPrimaryAdapterType: &schema.Schema{
+				Type:         schema.TypeString,
+				Optional:     true,
+				ForceNew:     true,
+				Default:      nil,
+				Description:  "The type of the server's primary network adapter (E1000 or VMXNET3)",
+				ValidateFunc: validateNICAdapterType,
 			},
 			resourceKeyServerPublicIPv4: &schema.Schema{
 				Type:        schema.TypeString,
@@ -100,7 +126,7 @@ func resourceServer() *schema.Resource {
 				Default:     nil,
 				Description: "The server's public IPv4 address (if any)",
 			},
-			resourceKeyServerPrimaryIPv6: &schema.Schema{
+			resourceKeyServerPrimaryAdapterIPv6: &schema.Schema{
 				Type:        schema.TypeString,
 				Computed:    true,
 				Description: "The IPv6 address of the server's primary network adapter",
@@ -174,7 +200,8 @@ func resourceServerCreate(data *schema.ResourceData, provider interface{}) error
 
 	log.Printf("Create server '%s' in network domain '%s' (description = '%s').", name, networkDomainID, description)
 
-	apiClient := provider.(*providerState).Client()
+	providerState := provider.(*providerState)
+	apiClient := providerState.Client()
 
 	networkDomain, err := apiClient.GetNetworkDomain(networkDomainID)
 	if err != nil {
@@ -214,8 +241,18 @@ func resourceServerCreate(data *schema.ResourceData, provider interface{}) error
 		if err != nil {
 			return err
 		}
+		if osImage == nil {
+			return fmt.Errorf("Unable to find OS image with Id '%s' in data centre '%s' (which is where the target network domain, '%s', is located).",
+				*osImageID,
+				dataCenterID,
+				networkDomainID,
+			)
+		}
 
-		log.Printf("Server will be deployed from OS image named '%s' (Id = '%s').", osImage.Name, osImage.ID)
+		log.Printf("Server will be deployed from OS image named '%s' (Id = '%s').",
+			osImage.Name,
+			osImage.ID,
+		)
 		data.Set(resourceKeyServerOSImageName, osImage.Name)
 	} else if osImageName != nil {
 		log.Printf("Looking up OS image '%s' by name...", *osImageName)
@@ -224,14 +261,19 @@ func resourceServerCreate(data *schema.ResourceData, provider interface{}) error
 		if err != nil {
 			return err
 		}
-
 		if osImage == nil {
-			log.Printf("Warning - unable to find an OS image named '%s' in data centre '%s' (which is where the target network domain, '%s', is located).", *osImageName, dataCenterID, networkDomainID)
-
-			return fmt.Errorf("Unable to find an OS image named '%s' in data centre '%s' (which is where the target network domain, '%s', is located).", *osImageName, dataCenterID, networkDomainID)
+			return fmt.Errorf(
+				"Unable to find an OS image named '%s' in data centre '%s' (which is where the target network domain, '%s', is located).",
+				*osImageName,
+				dataCenterID,
+				networkDomainID,
+			)
 		}
 
-		log.Printf("Server will be deployed from OS image named '%s' (Id = '%s').", osImage.Name, osImage.ID)
+		log.Printf("Server will be deployed from OS image named '%s' (Id = '%s').",
+			osImage.Name,
+			osImage.ID,
+		)
 		data.Set(resourceKeyServerOSImageID, osImage.ID)
 	} else if customerImageID != nil {
 		log.Printf("Looking up customer image '%s' by Id...", *customerImageID)
@@ -240,25 +282,40 @@ func resourceServerCreate(data *schema.ResourceData, provider interface{}) error
 		if err != nil {
 			return err
 		}
+		if customerImage == nil {
+			return fmt.Errorf("Unable to find customer image with Id '%s' in data centre '%s' (which is where the target network domain, '%s', is located).",
+				*customerImageID,
+				dataCenterID,
+				networkDomainID,
+			)
+		}
 
-		log.Printf("Server will be deployed from customer image named '%s' (Id = '%s').", customerImage.Name, customerImage.ID)
-		data.Set(resourceKeyServerOSImageName, osImage.Name)
+		log.Printf("Server will be deployed from customer image named '%s' (Id = '%s').",
+			customerImage.Name,
+			customerImage.ID,
+		)
+		data.Set(resourceKeyServerCustomerImageName, customerImage.Name)
 	} else if customerImageName != nil {
 		log.Printf("Looking up customer image '%s' by name...", *customerImageName)
 
-		osImage, err = apiClient.FindOSImage(*customerImageName, dataCenterID)
+		customerImage, err = apiClient.FindCustomerImage(*customerImageName, dataCenterID)
 		if err != nil {
 			return err
 		}
-
-		if osImage == nil {
-			log.Printf("Warning - unable to find a customer image named '%s' in data centre '%s' (which is where the target network domain, '%s', is located).", *customerImageName, dataCenterID, networkDomainID)
-
-			return fmt.Errorf("Unable to find a customer image named '%s' in data centre '%s' (which is where the target network domain, '%s', is located).", *customerImageName, dataCenterID, networkDomainID)
+		if customerImage == nil {
+			return fmt.Errorf(
+				"Unable to find a customer image named '%s' in data centre '%s' (which is where the target network domain, '%s', is located).",
+				*customerImageName,
+				dataCenterID,
+				networkDomainID,
+			)
 		}
 
-		log.Printf("Server will be deployed from OS image named '%s' (Id = '%s').", osImage.Name, osImage.ID)
-		data.Set(resourceKeyServerOSImageID, osImage.ID)
+		log.Printf("Server will be deployed from customer image named '%s' (Id = '%s').",
+			customerImage.Name,
+			customerImage.ID,
+		)
+		data.Set(resourceKeyServerCustomerImageID, customerImage.ID)
 	}
 
 	if osImage != nil {
@@ -290,15 +347,31 @@ func resourceServerCreate(data *schema.ResourceData, provider interface{}) error
 		data.Set(resourceKeyServerCPUCount, deploymentConfiguration.CPU.Count)
 	}
 
+	cpuCoreCount := propertyHelper.GetOptionalInt(resourceKeyServerCPUCoreCount, false)
+	if cpuCoreCount != nil {
+		deploymentConfiguration.CPU.CoresPerSocket = *cpuCoreCount
+	} else {
+		data.Set(resourceKeyServerCPUCoreCount, deploymentConfiguration.CPU.CoresPerSocket)
+	}
+
+	cpuSpeed := propertyHelper.GetOptionalString(resourceKeyServerCPUSpeed, false)
+	if cpuSpeed != nil {
+		deploymentConfiguration.CPU.Speed = *cpuSpeed
+	} else {
+		data.Set(resourceKeyServerCPUSpeed, deploymentConfiguration.CPU.Speed)
+	}
+
 	// Network
-	primaryVLANID := propertyHelper.GetOptionalString(resourceKeyServerPrimaryVLAN, false)
-	primaryIPv4Address := propertyHelper.GetOptionalString(resourceKeyServerPrimaryIPv4, false)
+	primaryVLANID := propertyHelper.GetOptionalString(resourceKeyServerPrimaryAdapterVLAN, false)
+	primaryIPv4Address := propertyHelper.GetOptionalString(resourceKeyServerPrimaryAdapterIPv4, false)
+	primaryAdapterType := propertyHelper.GetOptionalString(resourceKeyServerPrimaryAdapterType, false)
 
 	deploymentConfiguration.Network = compute.VirtualMachineNetwork{
 		NetworkDomainID: networkDomainID,
 		PrimaryAdapter: compute.VirtualMachineNetworkAdapter{
 			VLANID:             primaryVLANID,
 			PrivateIPv4Address: primaryIPv4Address,
+			AdapterType:        primaryAdapterType,
 		},
 	}
 	deploymentConfiguration.PrimaryDNS = primaryDNS
@@ -307,10 +380,17 @@ func resourceServerCreate(data *schema.ResourceData, provider interface{}) error
 	log.Printf("Server deployment configuration: %+v", deploymentConfiguration)
 	log.Printf("Server CPU deployment configuration: %+v", deploymentConfiguration.CPU)
 
+	// CloudControl has issues if more than one asynchronous operation is initated at a time (returns UNEXPECTED_ERROR).
+	asyncLock := providerState.AcquireAsyncOperationLock("Create network domain '%s'", name)
+	defer asyncLock.Release()
+
 	serverID, err := apiClient.DeployServer(deploymentConfiguration)
 	if err != nil {
 		return err
 	}
+
+	// Operation initiated; we no longer need this lock.
+	asyncLock.Release()
 
 	data.SetId(serverID)
 
@@ -322,10 +402,9 @@ func resourceServerCreate(data *schema.ResourceData, provider interface{}) error
 	}
 
 	// Capture additional properties that may only be available after deployment.
-	server := resource.(*compute.Server)
-	captureServerNetworkConfiguration(server, data, false)
-
 	data.Partial(true)
+	server := resource.(*compute.Server)
+	captureServerNetworkConfiguration(server, data, true)
 
 	var publicIPv4Address string
 	publicIPv4Address, err = findPublicIPv4Address(apiClient,
@@ -340,16 +419,15 @@ func resourceServerCreate(data *schema.ResourceData, provider interface{}) error
 	} else {
 		data.Set(resourceKeyServerPublicIPv4, nil)
 	}
-
 	data.SetPartial(resourceKeyServerPublicIPv4)
 
-	err = applyServerTags(data, apiClient)
+	err = applyServerTags(data, apiClient, providerState.Settings())
 	if err != nil {
 		return err
 	}
 	data.SetPartial(resourceKeyServerTag)
 
-	err = createDisks(server.Disks, data, apiClient)
+	err = createDisks(server.Disks, data, providerState)
 	if err != nil {
 		return err
 	}
@@ -382,12 +460,13 @@ func resourceServerRead(data *schema.ResourceData, provider interface{}) error {
 
 		return nil
 	}
-
 	data.Set(resourceKeyServerName, server.Name)
 	data.Set(resourceKeyServerDescription, server.Description)
 	data.Set(resourceKeyServerOSImageID, server.SourceImageID)
 	data.Set(resourceKeyServerMemoryGB, server.MemoryGB)
 	data.Set(resourceKeyServerCPUCount, server.CPU.Count)
+	data.Set(resourceKeyServerCPUCoreCount, server.CPU.CoresPerSocket)
+	data.Set(resourceKeyServerCPUSpeed, server.CPU.Speed)
 
 	captureServerNetworkConfiguration(server, data, false)
 
@@ -420,40 +499,75 @@ func resourceServerRead(data *schema.ResourceData, provider interface{}) error {
 func resourceServerUpdate(data *schema.ResourceData, provider interface{}) error {
 	serverID := data.Id()
 
-	// These changes can only be made through the V1 API (we're mostly using V2).
-	// Later, we can come back and implement the required functionality in the compute API client.
-	if data.HasChange(resourceKeyServerName) {
-		return fmt.Errorf("Changing the 'name' property of a 'ddcloud_server' resource type is not yet implemented.")
-	}
-
-	if data.HasChange(resourceKeyServerDescription) {
-		return fmt.Errorf("Changing the 'description' property of a 'ddcloud_server' resource type is not yet implemented.")
-	}
-
 	log.Printf("Update server '%s'.", serverID)
 
-	apiClient := provider.(*providerState).Client()
+	providerState := provider.(*providerState)
+
+	apiClient := providerState.Client()
 	server, err := apiClient.GetServer(serverID)
 	if err != nil {
 		return err
 	}
 
+	if server == nil {
+		log.Printf("Server '%s' has been deleted.", serverID)
+		data.SetId("")
+
+		return nil
+	}
+
+	serverLock := providerState.GetServerLock(serverID, "resourceServerUpdate(id = '%s')", serverID)
+	serverLock.Lock()
+	defer serverLock.Unlock()
+
 	data.Partial(true)
 
 	propertyHelper := propertyHelper(data)
 
-	var memoryGB, cpuCount *int
+	var name, description *string
+	if data.HasChange(resourceKeyServerName) {
+		name = propertyHelper.GetOptionalString(resourceKeyServerName, true)
+	}
+
+	if data.HasChange(resourceKeyServerDescription) {
+		description = propertyHelper.GetOptionalString(resourceKeyServerDescription, true)
+	}
+
+	if name != nil || description != nil {
+		log.Printf("Server name / description change detected.")
+
+		err = apiClient.EditServerMetadata(serverID, name, description)
+		if err != nil {
+			return err
+		}
+
+		if name != nil {
+			data.SetPartial(resourceKeyServerName)
+		}
+		if description != nil {
+			data.SetPartial(resourceKeyServerDescription)
+		}
+	}
+
+	var memoryGB, cpuCount, cpuCoreCount *int
+	var cpuSpeed *string
 	if data.HasChange(resourceKeyServerMemoryGB) {
 		memoryGB = propertyHelper.GetOptionalInt(resourceKeyServerMemoryGB, false)
 	}
 	if data.HasChange(resourceKeyServerCPUCount) {
 		cpuCount = propertyHelper.GetOptionalInt(resourceKeyServerCPUCount, false)
 	}
+	if data.HasChange(resourceKeyServerCPUCoreCount) {
+		cpuCoreCount = propertyHelper.GetOptionalInt(resourceKeyServerCPUCoreCount, false)
+	}
+	if data.HasChange(resourceKeyServerCPUSpeed) {
+		cpuSpeed = propertyHelper.GetOptionalString(resourceKeyServerCPUSpeed, false)
+	}
 
-	if memoryGB != nil || cpuCount != nil {
+	if memoryGB != nil || cpuCount != nil || cpuCoreCount != nil || cpuSpeed != nil {
 		log.Printf("Server CPU / memory configuration change detected.")
 
-		err = updateServerConfiguration(apiClient, server, memoryGB, cpuCount)
+		err = updateServerConfiguration(apiClient, server, memoryGB, cpuCount, cpuCoreCount, cpuSpeed)
 		if err != nil {
 			return err
 		}
@@ -468,11 +582,11 @@ func resourceServerUpdate(data *schema.ResourceData, provider interface{}) error
 	}
 
 	var primaryIPv4, primaryIPv6 *string
-	if data.HasChange(resourceKeyServerPrimaryIPv4) {
-		primaryIPv4 = propertyHelper.GetOptionalString(resourceKeyServerPrimaryIPv4, false)
+	if data.HasChange(resourceKeyServerPrimaryAdapterIPv4) {
+		primaryIPv4 = propertyHelper.GetOptionalString(resourceKeyServerPrimaryAdapterIPv4, false)
 	}
-	if data.HasChange(resourceKeyServerPrimaryIPv6) {
-		primaryIPv6 = propertyHelper.GetOptionalString(resourceKeyServerPrimaryIPv6, false)
+	if data.HasChange(resourceKeyServerPrimaryAdapterIPv6) {
+		primaryIPv6 = propertyHelper.GetOptionalString(resourceKeyServerPrimaryAdapterIPv6, false)
 	}
 
 	if primaryIPv4 != nil || primaryIPv6 != nil {
@@ -483,12 +597,12 @@ func resourceServerUpdate(data *schema.ResourceData, provider interface{}) error
 			return err
 		}
 
-		if data.HasChange(resourceKeyServerPrimaryIPv4) {
-			data.SetPartial(resourceKeyServerPrimaryIPv4)
+		if data.HasChange(resourceKeyServerPrimaryAdapterIPv4) {
+			data.SetPartial(resourceKeyServerPrimaryAdapterIPv4)
 		}
 
-		if data.HasChange(resourceKeyServerPrimaryIPv6) {
-			data.SetPartial(resourceKeyServerPrimaryIPv6)
+		if data.HasChange(resourceKeyServerPrimaryAdapterIPv6) {
+			data.SetPartial(resourceKeyServerPrimaryAdapterIPv6)
 		}
 
 		var publicIPv4Address string
@@ -507,7 +621,7 @@ func resourceServerUpdate(data *schema.ResourceData, provider interface{}) error
 	}
 
 	if data.HasChange(resourceKeyServerTag) {
-		err = applyServerTags(data, apiClient)
+		err = applyServerTags(data, apiClient, providerState.Settings())
 		if err != nil {
 			return err
 		}
@@ -516,7 +630,7 @@ func resourceServerUpdate(data *schema.ResourceData, provider interface{}) error
 	}
 
 	if data.HasChange(resourceKeyServerDisk) {
-		err = updateDisks(data, apiClient)
+		err = updateDisks(data, providerState)
 		if err != nil {
 			return err
 		}
@@ -537,7 +651,9 @@ func resourceServerDelete(data *schema.ResourceData, provider interface{}) error
 
 	log.Printf("Delete server '%s' ('%s') in network domain '%s'.", id, name, networkDomainID)
 
-	apiClient := provider.(*providerState).Client()
+	providerState := provider.(*providerState)
+
+	apiClient := providerState.Client()
 	server, err := apiClient.GetServer(id)
 	if err != nil {
 		return err
@@ -549,13 +665,24 @@ func resourceServerDelete(data *schema.ResourceData, provider interface{}) error
 		return nil
 	}
 
+	serverLock := providerState.GetServerLock(id, "resourceServerDelete(id = '%s')", id)
+	serverLock.Lock()
+	defer serverLock.Unlock()
+
 	if server.Started {
 		log.Printf("Server '%s' is currently running. The server will be powered off.", id)
+
+		// CloudControl has issues if more than one asynchronous operation is initated at a time (returns UNEXPECTED_ERROR).
+		asyncLock := providerState.AcquireAsyncOperationLock("Create network domain '%s'", name)
+		defer asyncLock.Release()
 
 		err = apiClient.PowerOffServer(id)
 		if err != nil {
 			return err
 		}
+
+		// Operation initiated; we no longer need this lock.
+		asyncLock.Release()
 
 		_, err = apiClient.WaitForChange(compute.ResourceTypeServer, id, "Power off server", serverShutdownTimeout)
 		if err != nil {
@@ -565,10 +692,17 @@ func resourceServerDelete(data *schema.ResourceData, provider interface{}) error
 
 	log.Printf("Server '%s' is being deleted...", id)
 
+	// CloudControl has issues if more than one asynchronous operation is initated at a time (returns UNEXPECTED_ERROR).
+	asyncLock := providerState.AcquireAsyncOperationLock("Create network domain '%s'", name)
+	defer asyncLock.Release()
+
 	err = apiClient.DeleteServer(id)
 	if err != nil {
 		return err
 	}
+
+	// Operation initiated; we no longer need this lock.
+	asyncLock.Release()
 
 	return apiClient.WaitForDelete(compute.ResourceTypeServer, id, resourceDeleteTimeoutServer)
 }

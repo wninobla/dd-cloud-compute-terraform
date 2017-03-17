@@ -3,6 +3,7 @@ package ddcloud
 import (
 	"github.com/DimensionDataResearch/go-dd-cloud-compute/compute"
 	"github.com/hashicorp/terraform/helper/schema"
+	"log"
 	"strconv"
 	"strings"
 )
@@ -14,6 +15,12 @@ type resourcePropertyHelper struct {
 
 func propertyHelper(data *schema.ResourceData) resourcePropertyHelper {
 	return resourcePropertyHelper{data}
+}
+
+func (helper resourcePropertyHelper) HasProperty(key string) bool {
+	_, ok := helper.data.GetOk(key)
+
+	return ok
 }
 
 func (helper resourcePropertyHelper) GetOptionalString(key string, allowEmpty bool) *string {
@@ -73,6 +80,35 @@ func (helper resourcePropertyHelper) SetStringSetItems(key string, items []strin
 
 	return helper.data.Set(key,
 		schema.NewSet(schema.HashString, rawItems),
+	)
+}
+
+func (helper resourcePropertyHelper) GetIntSetItems(key string) (items []int) {
+	value, ok := helper.data.GetOk(key)
+	if !ok || value == nil {
+		return
+	}
+	rawItems := value.(*schema.Set).List()
+
+	items = make([]int, len(rawItems))
+	for index, item := range rawItems {
+		items[index] = item.(int)
+	}
+
+	return
+}
+
+func (helper resourcePropertyHelper) SetIntSetItems(key string, items []int) error {
+	rawItems := make([]interface{}, len(items))
+	for index, item := range items {
+		rawItems[index] = item
+	}
+
+	hashInt := func(value interface{}) int {
+		return value.(int)
+	}
+	return helper.data.Set(key,
+		schema.NewSet(hashInt, rawItems),
 	)
 }
 
@@ -142,6 +178,120 @@ func (helper resourcePropertyHelper) SetTags(key string, tags []compute.Tag) {
 		})
 	}
 	helper.data.Set(key, tagProperties)
+}
+
+func (helper resourcePropertyHelper) GetAddressListAddresses() (addresses []compute.IPAddressListEntry) {
+	value, ok := helper.data.GetOk(resourceKeyAddressListAddresses)
+	if !ok {
+		return
+	}
+	portListAddresses := value.([]interface{})
+
+	addresses = make([]compute.IPAddressListEntry, len(portListAddresses))
+	for index, item := range portListAddresses {
+		entryProperties := item.(map[string]interface{})
+		entry := &compute.IPAddressListEntry{}
+
+		value, ok := entryProperties[resourceKeyAddressListAddressBegin]
+		if ok {
+			begin := value.(string)
+			if len(begin) > 0 {
+				log.Printf("Have address Begin '%s'", begin)
+				entry.Begin = value.(string)
+
+				value, ok = entryProperties[resourceKeyAddressListAddressEnd]
+				if ok {
+					endAddress := value.(string)
+					log.Printf("Have address End '%s'", endAddress)
+					if endAddress != "" {
+						entry.End = &endAddress
+					}
+				}
+			}
+		}
+
+		value, ok = entryProperties[resourceKeyAddressListAddressNetwork]
+		if ok {
+			network := value.(string)
+			if len(network) > 0 {
+				entry.Begin = network
+				log.Printf("Have address Network '%s'", entry.Begin)
+
+				value, ok = entryProperties[resourceKeyAddressListAddressPrefixSize]
+				if ok {
+					prefixSize := value.(int)
+					log.Printf("Have address PrefixSize '%d'", prefixSize)
+					entry.PrefixSize = &prefixSize
+				}
+			}
+		}
+
+		addresses[index] = *entry
+	}
+
+	return
+}
+
+func (helper resourcePropertyHelper) SetAddressListAddresses(addresses []compute.IPAddressListEntry) {
+	addressProperties := make([]interface{}, len(addresses))
+	for index, address := range addresses {
+		if address.PrefixSize == nil {
+			addressProperties[index] = map[string]interface{}{
+				resourceKeyAddressListAddressBegin: address.Begin,
+				resourceKeyAddressListAddressEnd:   address.End,
+			}
+		} else {
+			addressProperties[index] = map[string]interface{}{
+				resourceKeyAddressListAddressNetwork:    address.Begin,
+				resourceKeyAddressListAddressPrefixSize: *address.PrefixSize,
+			}
+		}
+	}
+
+	helper.data.Set(resourceKeyAddressListAddresses, addressProperties)
+}
+
+func (helper resourcePropertyHelper) GetPortListPorts() (ports []compute.PortListEntry) {
+	value, ok := helper.data.GetOk(resourceKeyPortListPort)
+	if !ok {
+		return
+	}
+	portListPorts := value.([]interface{})
+
+	ports = make([]compute.PortListEntry, len(portListPorts))
+	for index, item := range portListPorts {
+		portProperties := item.(map[string]interface{})
+		port := &compute.PortListEntry{}
+
+		value, ok := portProperties[resourceKeyPortListPortBegin]
+		if ok {
+			port.Begin = value.(int)
+		}
+
+		value, ok = portProperties[resourceKeyPortListPortEnd]
+		if ok {
+			endPort := value.(int)
+			if endPort != 0 {
+				port.End = &endPort
+			}
+		}
+
+		ports[index] = *port
+	}
+
+	return
+}
+
+func (helper resourcePropertyHelper) SetPortListPorts(ports []compute.PortListEntry) {
+	portProperties := make([]interface{}, len(ports))
+	for index, port := range ports {
+		portProperties[index] = map[string]interface{}{
+			resourceKeyPortListPortBegin: port.Begin,
+			resourceKeyPortListPortEnd:   port.End,
+		}
+	}
+
+	helper.data.Set(resourceKeyPortListPort, portProperties)
 }
 
 func (helper resourcePropertyHelper) GetServerDisks() (disks []compute.VirtualMachineDisk) {

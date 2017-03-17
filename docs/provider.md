@@ -75,10 +75,20 @@ resource "ddcloud_firewall_rule" "myvm_http_in" {
 
 The following arguments are supported:
 
+* `region` - (Optional) The Managed Cloud Platform region code (e.g. 'AU' - Australia, 'EU' - Europe, 'NA' - North America) that identifies the CloudControl end-point to connect to.  
+Must specify exactly one of either `region` or `cloudcontrol_endpoint`.
+* `cloudcontrol_endpoint` - (Optional) The base URL of the CloudControl end-point to connect to.  
+Use this property if you are using PCEE or some other custom end-point that does not follow the standard pattern (`https://api-<region>.dimensiondata.com/`).  
+Must specify exactly one of either `cloudcontrol_endpoint` or `region`.
 * `username` - (Optional) The user name for authenticating to CloudControl.  
-If not specified, the `DD_COMPUTE_USER` environment variable will be used instead.
+If not specified, the `MCP_USER` environment variable will be used instead.
 * `password` - (Optional) The password for authenticating to CloudControl.  
-If not specified, the `DD_COMPUTE_PASSWORD` environment variable will be used instead.
+If not specified, the `MCP_PASSWORD` environment variable will be used instead.
 * `region` - (Optional) The Managed Cloud Platform region code (e.g. 'AU' - Australia, 'EU' - Europe, 'NA' - North America) that identifies the CloudControl end-point to connect to.
-* `retry_count` - (Optional) The maximum number of times that the provider should retry operations that fail due to a network connectivity error.
-* `retry_delay` - (Optional) The time (in seconds) to delay between operation retries.
+* `retry_timeout` - (Optional) The time (in seconds) to wait before before retrying an operation due to a `RESOURCE_BUSY` response from CloudControl times out.    
+Default is 10 minutes.
+* `retry_delay` - (Optional) The time (in seconds) to delay between operation retries due to `RESOURCE_BUSY` responses from CloudControl.  
+Default is 30 seconds.
+* `allow_server_reboot` - (Optional) Allow servers to be rebooted due to configuration changes?  
+  If `false`, then the provider will fail any operation (except deletion) that requires a server to be rebooted.  
+  Default is `true`.

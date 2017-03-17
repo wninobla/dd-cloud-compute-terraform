@@ -2,9 +2,10 @@ package ddcloud
 
 import (
 	"fmt"
+	"log"
+
 	"github.com/DimensionDataResearch/go-dd-cloud-compute/compute"
 	"github.com/hashicorp/terraform/helper/schema"
-	"log"
 )
 
 const (
@@ -38,7 +39,7 @@ func schemaServerTag() *schema.Schema {
 }
 
 // Apply configured tags to a server.
-func applyServerTags(data *schema.ResourceData, apiClient *compute.Client) error {
+func applyServerTags(data *schema.ResourceData, apiClient *compute.Client, providerSettings ProviderSettings) error {
 	var (
 		response *compute.APIResponseV2
 		err      error
@@ -51,9 +52,7 @@ func applyServerTags(data *schema.ResourceData, apiClient *compute.Client) error
 	propertyHelper := propertyHelper(data)
 	configuredTags := propertyHelper.GetTags(resourceKeyServerTag)
 
-	// TODO: Support multiple pages of results.
-	var serverTags *compute.TagDetails
-	serverTags, err = apiClient.GetAssetTags(serverID, compute.AssetTypeServer, nil)
+	serverTags, err := getServerTags(apiClient, serverID)
 	if err != nil {
 		return err
 	}
@@ -62,7 +61,7 @@ func applyServerTags(data *schema.ResourceData, apiClient *compute.Client) error
 	unusedTags := &schema.Set{
 		F: schema.HashString,
 	}
-	for _, tag := range serverTags.Items {
+	for _, tag := range serverTags {
 		unusedTags.Add(tag.Name)
 	}
 	for _, tag := range configuredTags {
@@ -114,24 +113,14 @@ func readServerTags(data *schema.ResourceData, apiClient *compute.Client) error 
 
 	log.Printf("Reading tags for server '%s'...", serverID)
 
-	result, err := apiClient.GetAssetTags(serverID, compute.AssetTypeServer, nil)
+	serverTags, err := getServerTags(apiClient, serverID)
 	if err != nil {
 		return err
 	}
 
-	log.Printf("Read %d tags for server '%s'.", result.PageCount, serverID)
+	log.Printf("Read %d tags for server '%s'.", len(serverTags), serverID)
 
-	// TODO: Handle multiple pages of results.
-
-	tags := make([]compute.Tag, len(result.Items))
-	for index, tagDetail := range result.Items {
-		tags[index] = compute.Tag{
-			Name:  tagDetail.Name,
-			Value: tagDetail.Value,
-		}
-	}
-
-	propertyHelper.SetTags(resourceKeyServerTag, tags)
+	propertyHelper.SetTags(resourceKeyServerTag, serverTags)
 
 	return nil
 }
@@ -152,4 +141,39 @@ func hashServerTag(item interface{}) int {
 		tagData[resourceKeyServerTagName].(string),
 		tagData[resourceKeyServerTagValue].(string),
 	))
+}
+
+func getServerTags(apiClient *compute.Client, serverID string) (serverTags []compute.Tag, err error) {
+	page := compute.DefaultPaging()
+	page.PageSize = 20
+
+	var tagDetails *compute.TagDetails
+	for {
+		tagDetails, err = apiClient.GetAssetTags(serverID, compute.AssetTypeServer, page)
+		if err != nil {
+			apiError, ok := err.(*compute.APIError)
+			if ok && apiError.Response.GetResponseCode() == compute.ResponseCodeUnexpectedError {
+				// This is due to a bug in the CloudControl API (asking for a non-existent page results in UNKNOWN_ERROR).
+				err = nil
+
+				break
+			}
+
+			return
+		}
+
+		if tagDetails.IsEmpty() {
+			break
+		}
+
+		for _, tagDetail := range tagDetails.Items {
+			serverTags = append(serverTags,
+				tagDetail.ToTag(),
+			)
+		}
+
+		page.Next()
+	}
+
+	return
 }

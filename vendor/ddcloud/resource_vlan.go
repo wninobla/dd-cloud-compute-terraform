@@ -1,10 +1,13 @@
 package ddcloud
 
 import (
-	"github.com/DimensionDataResearch/go-dd-cloud-compute/compute"
-	"github.com/hashicorp/terraform/helper/schema"
+	"fmt"
 	"log"
 	"time"
+
+	"github.com/DimensionDataResearch/dd-cloud-compute-terraform/retry"
+	"github.com/DimensionDataResearch/go-dd-cloud-compute/compute"
+	"github.com/hashicorp/terraform/helper/schema"
 )
 
 const (
@@ -16,7 +19,13 @@ const (
 	resourceKeyVLANIPv6BaseAddress = "ipv6_base_address"
 	resourceKeyVLANIPv6PrefixSize  = "ipv6_prefix_size"
 	resourceCreateTimeoutVLAN      = 5 * time.Minute
+	resourceEditTimeoutVLAN        = 3 * time.Minute
 	resourceDeleteTimeoutVLAN      = 5 * time.Minute
+
+	// No more than 3 at a time for now
+	deployTimeoutVLAN = 3 * resourceCreateTimeoutVLAN
+	editTimeoutVLAN   = 3 * resourceEditTimeoutVLAN
+	deleteTimeoutVLAN = 3 * resourceDeleteTimeoutVLAN
 )
 
 func resourceVLAN() *schema.Resource {
@@ -87,12 +96,28 @@ func resourceVLANCreate(data *schema.ResourceData, provider interface{}) error {
 	providerState := provider.(*providerState)
 	apiClient := providerState.Client()
 
-	domainLock := providerState.GetDomainLock(networkDomainID, "resourceVLANCreate(name = '%s')", name)
-	domainLock.Lock()
-	defer domainLock.Unlock()
+	var (
+		vlanID string
+		err    error
+	)
+	operationDescription := fmt.Sprintf("Create VLAN '%s'", name)
+	err = retry.Action(operationDescription, deployTimeoutVLAN, func(context retry.Context) {
+		// CloudControl has issues if more than one asynchronous operation is initated at a time (returns UNEXPECTED_ERROR).
+		asyncLock := providerState.AcquireAsyncOperationLock(operationDescription)
+		defer asyncLock.Release() // Released at the end of the current attempt.
 
-	// TODO: Handle RESOURCE_BUSY response (retry?)
-	vlanID, err := apiClient.DeployVLAN(networkDomainID, name, description, ipv4BaseAddress, ipv4PrefixSize)
+		var deployError error
+		vlanID, deployError = apiClient.DeployVLAN(networkDomainID, name, description, ipv4BaseAddress, ipv4PrefixSize)
+		if deployError != nil {
+			if compute.IsResourceBusyError(deployError) {
+				context.Retry()
+			} else {
+				context.Fail(deployError)
+			}
+		}
+
+		asyncLock.Release()
+	})
 	if err != nil {
 		return err
 	}
@@ -156,7 +181,6 @@ func resourceVLANUpdate(data *schema.ResourceData, provider interface{}) error {
 	)
 
 	id = data.Id()
-	networkDomainID := data.Get(resourceKeyVLANNetworkDomainID).(string)
 
 	name = data.Get(resourceKeyVLANName).(string)
 	if data.HasChange(resourceKeyVLANName) {
@@ -173,16 +197,28 @@ func resourceVLANUpdate(data *schema.ResourceData, provider interface{}) error {
 	providerState := provider.(*providerState)
 	apiClient := providerState.Client()
 
-	domainLock := providerState.GetDomainLock(networkDomainID, "resourceVLANUpdate(id = '%s', name = '%s')", id, name)
-	domainLock.Lock()
-	defer domainLock.Unlock()
-
 	if newName == nil && newDescription == nil {
 		return nil
 	}
 
-	// TODO: Handle RESOURCE_BUSY response (retry?)
-	return apiClient.EditVLAN(id, newName, newDescription)
+	operationDescription := fmt.Sprintf("Edit VLAN '%s'", name)
+
+	return retry.Action(operationDescription, deployTimeoutVLAN, func(context retry.Context) {
+		// CloudControl has issues if more than one asynchronous operation is initated at a time (returns UNEXPECTED_ERROR).
+		asyncLock := providerState.AcquireAsyncOperationLock(operationDescription)
+		defer asyncLock.Release() // Released at the end of the current attempt.
+
+		editError := apiClient.EditVLAN(id, newName, newDescription)
+		if editError != nil {
+			if compute.IsResourceBusyError(editError) {
+				context.Retry()
+			} else {
+				context.Fail(editError)
+			}
+		}
+
+		asyncLock.Release()
+	})
 }
 
 // Delete a VLAN resource.
@@ -196,17 +232,28 @@ func resourceVLANDelete(data *schema.ResourceData, provider interface{}) error {
 	providerState := provider.(*providerState)
 	apiClient := providerState.Client()
 
-	domainLock := providerState.GetDomainLock(networkDomainID, "resourceVLANDelete(id = '%s', name = '%s')", id, name)
-	domainLock.Lock()
-	defer domainLock.Unlock()
+	operationDescription := fmt.Sprintf("Delete VLAN '%s'", id)
+	err := providerState.Retry().Action(operationDescription, deleteTimeoutVLAN, func(context retry.Context) {
+		// CloudControl has issues if more than one asynchronous operation is initated at a time (returns UNEXPECTED_ERROR).
+		asyncLock := providerState.AcquireAsyncOperationLock(operationDescription)
+		defer asyncLock.Release() // Released once the current attempt is complete.
 
-	err := apiClient.DeleteVLAN(id)
+		deleteError := apiClient.DeleteVLAN(id)
+		if deleteError != nil {
+			if compute.IsResourceBusyError(deleteError) {
+				context.Retry()
+			} else {
+				context.Fail(deleteError)
+			}
+		}
+
+		asyncLock.Release()
+	})
 	if err != nil {
 		return err
 	}
 
 	log.Printf("VLAN '%s' is being deleted...", id)
 
-	// TODO: Handle RESOURCE_BUSY response (retry?)
 	return apiClient.WaitForDelete(compute.ResourceTypeVLAN, id, resourceDeleteTimeoutServer)
 }

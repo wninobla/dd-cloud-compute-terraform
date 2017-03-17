@@ -1,11 +1,14 @@
 package ddcloud
 
 import (
-	"github.com/DimensionDataResearch/go-dd-cloud-compute/compute"
-	"github.com/hashicorp/terraform/helper/schema"
+	"fmt"
 	"log"
 	"strings"
 	"time"
+
+	"github.com/DimensionDataResearch/dd-cloud-compute-terraform/retry"
+	"github.com/DimensionDataResearch/go-dd-cloud-compute/compute"
+	"github.com/hashicorp/terraform/helper/schema"
 )
 
 const (
@@ -14,6 +17,7 @@ const (
 	resourceKeyNetworkDomainPlan           = "plan"
 	resourceKeyNetworkDomainDataCenter     = "datacenter"
 	resourceKeyNetworkDomainNatIPv4Address = "nat_ipv4_address"
+	resourceKeyNetworkDomainFirewallRule   = "default_firewall_rule"
 	resourceCreateTimeoutNetworkDomain     = 5 * time.Minute
 	resourceDeleteTimeoutNetworkDomain     = 5 * time.Minute
 )
@@ -59,6 +63,7 @@ func resourceNetworkDomain() *schema.Resource {
 				Computed:    true,
 				Description: "The IPv4 address for the network domain's IPv6->IPv4 Source Network Address Translation (SNAT). This is the IPv4 address of the network domain's IPv4 egress",
 			},
+			resourceKeyNetworkDomainFirewallRule: schemaNetworkDomainFirewallRule(),
 		},
 	}
 }
@@ -72,11 +77,29 @@ func resourceNetworkDomainCreate(data *schema.ResourceData, provider interface{}
 	plan = data.Get(resourceKeyNetworkDomainPlan).(string)
 	dataCenterID = data.Get(resourceKeyNetworkDomainDataCenter).(string)
 
+	providerState := provider.(*providerState)
+	providerSettings := providerState.Settings()
+	apiClient := providerState.Client()
+
 	log.Printf("Create network domain '%s' in data center '%s' (plan = '%s', description = '%s').", name, dataCenterID, plan, description)
 
-	// TODO: Handle RESOURCE_BUSY response (retry?)
-	apiClient := provider.(*providerState).Client()
-	networkDomainID, err := apiClient.DeployNetworkDomain(name, description, plan, dataCenterID)
+	var networkDomainID string
+	operationDescription := fmt.Sprintf("Create network domain '%s'", name)
+	err := providerState.Retry().Action(operationDescription, providerSettings.RetryTimeout, func(context retry.Context) {
+		// CloudControl has issues if more than one asynchronous operation is initated at a time (returns UNEXPECTED_ERROR).
+		asyncLock := providerState.AcquireAsyncOperationLock("Create network domain '%s'", name)
+		defer asyncLock.Release()
+
+		var deployError error
+		networkDomainID, deployError = apiClient.DeployNetworkDomain(name, description, plan, dataCenterID)
+		if compute.IsResourceBusyError(deployError) {
+			context.Retry()
+		} else if deployError != nil {
+			context.Fail(deployError)
+		}
+
+		asyncLock.Release()
+	})
 	if err != nil {
 		return err
 	}
@@ -90,9 +113,19 @@ func resourceNetworkDomainCreate(data *schema.ResourceData, provider interface{}
 		return err
 	}
 
+	data.Partial(true)
+
 	// Capture additional properties that are only available after deployment.
 	networkDomain := resource.(*compute.NetworkDomain)
 	data.Set(resourceKeyNetworkDomainNatIPv4Address, networkDomain.NatIPv4Address)
+	data.SetPartial(resourceKeyNetworkDomainNatIPv4Address)
+
+	err = applyNetworkDomainDefaultFirewallRules(data, apiClient)
+	if err != nil {
+		return err
+	}
+
+	data.Partial(false)
 
 	return nil
 }
@@ -116,15 +149,29 @@ func resourceNetworkDomainRead(data *schema.ResourceData, provider interface{}) 
 		return err
 	}
 
+	data.Partial(true)
+
 	if networkDomain != nil {
 		data.Set(resourceKeyNetworkDomainName, networkDomain.Name)
+		data.SetPartial(resourceKeyNetworkDomainName)
 		data.Set(resourceKeyNetworkDomainDescription, networkDomain.Description)
+		data.SetPartial(resourceKeyNetworkDomainDescription)
 		data.Set(resourceKeyNetworkDomainPlan, networkDomain.Type)
+		data.SetPartial(resourceKeyNetworkDomainPlan)
 		data.Set(resourceKeyNetworkDomainDataCenter, networkDomain.DatacenterID)
+		data.SetPartial(resourceKeyNetworkDomainDataCenter)
 		data.Set(resourceKeyNetworkDomainNatIPv4Address, networkDomain.NatIPv4Address)
+		data.SetPartial(resourceKeyNetworkDomainNatIPv4Address)
 	} else {
 		data.SetId("") // Mark resource as deleted.
 	}
+
+	err = readNetworkDomainDefaultFirewallRules(data, apiClient)
+	if err != nil {
+		return err
+	}
+
+	data.Partial(false)
 
 	return nil
 }
@@ -158,27 +205,71 @@ func resourceNetworkDomainUpdate(data *schema.ResourceData, provider interface{}
 	providerState := provider.(*providerState)
 	apiClient := providerState.Client()
 
-	// TODO: Handle RESOURCE_BUSY response (retry?)
-	return apiClient.EditNetworkDomain(id, newName, newDescription, newPlan)
+	var err error
+	if newName != nil || newPlan != nil {
+		err = apiClient.EditNetworkDomain(id, newName, newDescription, newPlan)
+		if err != nil {
+			return err
+		}
+	}
+
+	err = applyNetworkDomainDefaultFirewallRules(data, apiClient)
+	if err != nil {
+		return err
+	}
+
+	return nil
 }
 
 // Delete a network domain resource.
 func resourceNetworkDomainDelete(data *schema.ResourceData, provider interface{}) error {
-	var err error
-
 	networkDomainID := data.Id()
 	name := data.Get(resourceKeyNetworkDomainName).(string)
 	dataCenterID := data.Get(resourceKeyNetworkDomainDataCenter).(string)
 
 	log.Printf("Delete network domain '%s' ('%s') in data center '%s'.", networkDomainID, name, dataCenterID)
 
-	apiClient := provider.(*providerState).Client()
+	providerState := provider.(*providerState)
+	providerSettings := providerState.Settings()
+	apiClient := providerState.Client()
 
-	// First, check if the network domain has any allocated public IP blocks.
+	err := deleteAllPublicIPBlocks(networkDomainID, providerState)
+	if err != nil {
+		return err
+	}
+
+	operationDescription := fmt.Sprintf("Create network domain '%s'", name)
+	err = providerState.Retry().Action(operationDescription, providerSettings.RetryTimeout, func(context retry.Context) {
+		// CloudControl has issues if more than one asynchronous operation is initated at a time (returns UNEXPECTED_ERROR).
+		asyncLock := providerState.AcquireAsyncOperationLock("Delete network domain '%s'", networkDomainID)
+		defer asyncLock.Release()
+
+		deleteError := apiClient.DeleteNetworkDomain(networkDomainID)
+		if compute.IsResourceBusyError(deleteError) {
+			context.Retry()
+		} else if err != nil {
+			context.Fail(deleteError)
+		}
+
+		asyncLock.Release()
+	})
+	if err != nil {
+		return err
+	}
+
+	log.Printf("Network domain '%s' is being deleted...", networkDomainID)
+
+	return apiClient.WaitForDelete(compute.ResourceTypeNetworkDomain, networkDomainID, resourceDeleteTimeoutServer)
+}
+
+// Delete all public IP blocks (if any) in a network domain.
+func deleteAllPublicIPBlocks(networkDomainID string, providerState *providerState) error {
+	apiClient := providerState.Client()
+
 	page := compute.DefaultPaging()
 	for {
 		var publicIPBlocks *compute.PublicIPBlocks
-		publicIPBlocks, err = apiClient.ListPublicIPBlocks(networkDomainID, page)
+		publicIPBlocks, err := apiClient.ListPublicIPBlocks(networkDomainID, page)
 		if err != nil {
 			return err
 		}
@@ -200,13 +291,5 @@ func resourceNetworkDomainDelete(data *schema.ResourceData, provider interface{}
 		page.Next()
 	}
 
-	// TODO: Handle RESOURCE_BUSY response (retry?)
-	err = apiClient.DeleteNetworkDomain(networkDomainID)
-	if err != nil {
-		return err
-	}
-
-	log.Printf("Network domain '%s' is being deleted...", networkDomainID)
-
-	return apiClient.WaitForDelete(compute.ResourceTypeNetworkDomain, networkDomainID, resourceDeleteTimeoutServer)
+	return nil
 }
